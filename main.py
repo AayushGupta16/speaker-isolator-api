@@ -1,3 +1,4 @@
+import os
 import io
 import re
 import logging
@@ -10,13 +11,20 @@ from pydub import AudioSegment
 import requests
 import time
 
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 app = Flask(__name__)
 CORS(app)
 
-API_KEY = "YOUR_API_KEY"  # Replace with your actual AssemblyAI API key
+# Constants
+API_KEY = os.environ.get("ASSEMBLY_AI_API_KEY")  # Get the AssemblyAI API key from the environment variable
 ASSEMBLY_AI_UPLOAD_ENDPOINT = "https://api.assemblyai.com/v2/upload"
 ASSEMBLY_AI_TRANSCRIPT_ENDPOINT = "https://api.assemblyai.com/v2/transcript"
+PAUSE_DURATION_MS = 500  # Pause duration between speaker segments in milliseconds
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -29,7 +37,7 @@ def download_youtube_video(url):
     try:
         audio_data = io.BytesIO()
         yt = YouTube(url)
-        stream = yt.streams.filter(only_audio=True).first()
+        stream = yt.streams.filter(only_audio=True).first()  # Get the first audio stream
         stream.stream_to_buffer(audio_data)  # Download the audio stream and write it to the audio_data buffer
         audio_data.seek(0)  # Reset the buffer position to the beginning
         audio = AudioSegment.from_file(audio_data, format="mp4")
@@ -41,31 +49,33 @@ def download_youtube_video(url):
         logger.error(f"Error downloading YouTube video: {str(e)}")
         raise
 
-def upload_audio(audio_bytes):
+def upload_audio(audio_bytes, api_key):
     """
     Upload the audio data to AssemblyAI.
     :param audio_bytes: The audio data as bytes.
+    :param api_key: The AssemblyAI API key.
     :return: The upload URL.
     """
     headers = {
-        "authorization": API_KEY,
+        "authorization": api_key,
         "content-type": "application/octet-stream",
     }
     response = requests.post(ASSEMBLY_AI_UPLOAD_ENDPOINT, headers=headers, data=audio_bytes)
-    response.raise_for_status()
+    response.raise_for_status()  # Raise an exception for non-2xx status codes
     return response.json()["upload_url"]
 
-def get_transcript(upload_url):
+def get_transcript(upload_url, api_key):
     """
     Get the transcript from AssemblyAI.
     :param upload_url: The upload URL returned by the upload_audio function.
+    :param api_key: The AssemblyAI API key.
     :return: The transcript data.
     """
     try:
-        headers = {"authorization": API_KEY, "content-type": "application/json"}
+        headers = {"authorization": api_key, "content-type": "application/json"}
         json_data = {
             "audio_url": upload_url,
-            "speaker_labels": True,
+            "speaker_labels": True,  # Request speaker labels in the transcript
         }
 
         response = requests.post(ASSEMBLY_AI_TRANSCRIPT_ENDPOINT, json=json_data, headers=headers)
@@ -112,9 +122,8 @@ def create_speaker_segments(transcript, audio_bytes):
             if speaker not in speaker_segments:
                 speaker_segments[speaker] = segment
             else:
-                pause_duration = 500  # Add a pause between segments
-                pause = AudioSegment.silent(duration=pause_duration)
-                speaker_segments[speaker] += pause + segment
+                pause = AudioSegment.silent(duration=PAUSE_DURATION_MS)
+                speaker_segments[speaker] += pause + segment  # Concatenate the segments with a pause
 
             if speaker not in speaker_individual_segments:
                 speaker_individual_segments[speaker] = [segment]
@@ -150,9 +159,13 @@ def process_video_endpoint():
         if not re.match(r'^(www\.)?youtube\.com', parsed_url.netloc):  # Validate the YouTube URL
             abort(400, description="Invalid YouTube URL.")
 
+        api_key = API_KEY
+        if not api_key:
+            abort(400, description="Missing API key. Please set the ASSEMBLY_AI_API_KEY environment variable.")
+
         original_audio_bytes = download_youtube_video(youtube_url)  # Download the audio from the YouTube video
-        upload_url = upload_audio(original_audio_bytes.getvalue())  # Upload the audio to AssemblyAI
-        transcript = get_transcript(upload_url)  # Get the transcript using the AssemblyAI API
+        upload_url = upload_audio(original_audio_bytes.getvalue(), api_key)  # Upload the audio to AssemblyAI
+        transcript = get_transcript(upload_url, api_key)  # Get the transcript using the AssemblyAI API
         speakers_audio = create_speaker_segments(transcript, original_audio_bytes.getvalue())  # Create speaker segments
 
         # Create a ZIP file containing the output audio files
