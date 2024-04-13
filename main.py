@@ -1,184 +1,194 @@
-import requests
-import time
-import json
-from firebase_admin import credentials, storage, initialize_app
+import os
 import io
+import re
+import logging
+import zipfile
+from flask import Flask, request, abort, send_file
+from flask_cors import CORS
+from urllib.parse import urlparse
 from pytube import YouTube
 from pydub import AudioSegment
-from pytube.exceptions import PytubeError
-from requests.exceptions import HTTPError, ConnectionError
-from firebase_admin.exceptions import FirebaseError
+import requests
+import time
 
-# Initialize Firebase app
-cred = credentials.Certificate("./firebase_auth.json")
-app = initialize_app(cred, {'storageBucket': 'elevenlabsauto.appspot.com'}, name='storage')
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
 
+app = Flask(__name__)
+CORS(app)
 
-def process_video(api_key, youtube_url, output_filename, use_saved_data, transcript_file_path="transcript.json"):
-    try:
-        print("Downloading YouTube Video")
-        #Download Video
-        original_audio_bytes = download_youtube_video_pytube(youtube_url)  # Download the YouTube video's audio
-        #Upload the audio to firebase, returns the url
-        blob, url = upload_to_firebase(output_filename, original_audio_bytes)
-        if not blob or not url:
-            print("Error: Failed to upload audio file to Firebase.")
-            return None
+# Constants
+API_KEY = os.environ.get("ASSEMBLY_AI_API_KEY")  # Get the AssemblyAI API key from the environment variable
+ASSEMBLY_AI_UPLOAD_ENDPOINT = "https://api.assemblyai.com/v2/upload"
+ASSEMBLY_AI_TRANSCRIPT_ENDPOINT = "https://api.assemblyai.com/v2/transcript"
+PAUSE_DURATION_MS = 500  # Pause duration between speaker segments in milliseconds
 
-        #Fetches the transcript
-        audio_url = url
-        transcript = get_transcript(api_key, audio_url)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-        if not transcript:
-            print("Error: Transcript data is not available.")
-            return None
-
-
-        #Deletes blob
-        delete_from_firebase(blob)
-
-        #Creates array of speaker files, each file should should mp3 bytes
-        speaker_files = create_speaker_segments(transcript, original_audio_bytes)
-
-        speaker_files = sorted(speaker_files, key=lambda x: x[0].split('_')[1])  # Sort the speaker files by name
-        return speaker_files  # Return the speaker files
-
-    except PytubeError as err:
-        print(f"Error: Failed to download YouTube video. {err}")
-        return None
-    except Exception as e:
-        print(f"An error occurred: {str(e)}")
-        return None
-
-
-def download_youtube_video_pytube(url):
+def download_youtube_video(url):
+    """
+    Download the audio from a YouTube video.
+    :param url: The URL of the YouTube video.
+    :return: The audio data as an io.BytesIO object.
+    """
     try:
         audio_data = io.BytesIO()
         yt = YouTube(url)
-        stream = yt.streams.filter(only_audio=True).first()
-        # Download the stream and write it to the audio_data buffer
-        stream.stream_to_buffer(audio_data)
-
-        # Reset the buffer position to the beginning
-        audio_data.seek(0)
-
-        # Convert raw data to MP3
+        stream = yt.streams.filter(only_audio=True).first()  # Get the first audio stream
+        stream.stream_to_buffer(audio_data)  # Download the audio stream and write it to the audio_data buffer
+        audio_data.seek(0)  # Reset the buffer position to the beginning
         audio = AudioSegment.from_file(audio_data, format="mp4")
         mp3_data = io.BytesIO()
-        audio.export(mp3_data, format="mp3")
-
-        # Reset the buffer position to the beginning
-        mp3_data.seek(0)
+        audio.export(mp3_data, format="mp3")  # Convert the audio to MP3 format
+        mp3_data.seek(0)  # Reset the buffer position to the beginning
         return mp3_data
-
     except Exception as e:
-        print(f"Error in downloading or converting YouTube video: {str(e)}")
-        return None
+        logger.error(f"Error downloading YouTube video: {str(e)}")
+        raise
 
+def upload_audio(audio_bytes, api_key):
+    """
+    Upload the audio data to AssemblyAI.
+    :param audio_bytes: The audio data as bytes.
+    :param api_key: The AssemblyAI API key.
+    :return: The upload URL.
+    """
+    headers = {
+        "authorization": api_key,
+        "content-type": "application/octet-stream",
+    }
+    response = requests.post(ASSEMBLY_AI_UPLOAD_ENDPOINT, headers=headers, data=audio_bytes)
+    response.raise_for_status()  # Raise an exception for non-2xx status codes
+    return response.json()["upload_url"]
 
-def upload_to_firebase(file_name, file_data):
+def get_transcript(upload_url, api_key):
+    """
+    Get the transcript from AssemblyAI.
+    :param upload_url: The upload URL returned by the upload_audio function.
+    :param api_key: The AssemblyAI API key.
+    :return: The transcript data.
+    """
     try:
-        bucket = storage.bucket(app=app)
-        blob = bucket.blob(file_name)
-        blob.upload_from_file(file_data)
-        blob.make_public()
-        return blob, blob.public_url
+        headers = {"authorization": api_key, "content-type": "application/json"}
+        json_data = {
+            "audio_url": upload_url,
+            "speaker_labels": True,  # Request speaker labels in the transcript
+        }
 
-    except FirebaseError as err:
-        print(f"Error in uploading to Firebase: {err}")
-        return None, None
-
-
-def delete_from_firebase(blob):
-    try:
-        blob.delete()
-    except FirebaseError as err:
-        print(f"Error in deleting from Firebase: {err}")
-
-
-def get_transcript(api_key, audio_url, save_json=True, json_file_path="transcript.json"):
-    endpoint = "https://api.assemblyai.com/v2/transcript"
-    headers = {"authorization": api_key}
-    json_data = {"audio_url": audio_url, "speaker_labels": True}
-
-    try:
-        # Make a POST request to the endpoint with the JSON data and headers
-        post_response = requests.post(endpoint, json=json_data, headers=headers)
-        post_response.raise_for_status()  # Raise an exception for non-2xx response codes
-        post_response_json = post_response.json()
-        transcript_id = post_response_json['id']  # Get the transcript ID from the response
+        response = requests.post(ASSEMBLY_AI_TRANSCRIPT_ENDPOINT, json=json_data, headers=headers)
+        response.raise_for_status()
+        transcript_id = response.json()["id"]
 
         while True:
-            url = f"{endpoint}/{transcript_id}"  # Create the URL for the GET request
-            get_response = requests.get(url, headers=headers).json()  # Get the response JSON data
-            status = get_response['status']  # Get the status from the response
+            response = requests.get(f"{ASSEMBLY_AI_TRANSCRIPT_ENDPOINT}/{transcript_id}", headers=headers)
+            response.raise_for_status()
+            transcript_data = response.json()
 
-            # Handle the different statuses
-            if status == 'completed':  # If the transcript is complete
-                if save_json:  # If saving the transcript JSON data to a file is enabled
-                    with open(json_file_path, 'w') as json_file:  # Open the JSON file for writing
-                        json.dump(get_response, json_file)  # Save the JSON data to the file
-                return get_response  # Return the transcript JSON data
-            elif status == 'processing':  # If the transcript is still processing
-                print("Processing...")  # Print a message to indicate processing
-                time.sleep(5)  # Sleep for 5 seconds before checking the status again
-            else:  # If there's an error or an unexpected status
-                print(f"Error: {status}")  # Print an error message with the status
-                return None  # Return None to indicate an error
-
-    except HTTPError as err:
-        print(f"HTTPError in getting transcript: {err}")
-        return None
-    except ConnectionError as err:
-        print(f"ConnectionError in getting transcript: {err}")
-        return None
-    except Exception as err:
-        print(f"Unexpected error in getting transcript: {err}")
-        return None
-
-
-def get_transcript_from_file(file_path):
-    try:
-        with open(file_path, "r") as f:  # Open the file for reading
-            transcript_data = json.load(f)  # Load the JSON data from the file
-        return transcript_data  # Return the transcript JSON data
-
-    except FileNotFoundError:
-        print(f"Error: Transcript file not found at '{file_path}'.")
-        return None
-    except json.JSONDecodeError:
-        print(f"Error: Failed to decode JSON from '{file_path}'.")
-        return None
-
-
-def create_speaker_segments(data, audio_bytes):
-    try:
-        full_audio = AudioSegment.from_file(io.BytesIO(audio_bytes.getvalue()), format='mp3')
-        speaker_audios = {}
-        output_files = []
-        last_end_time = {speaker: 0 for speaker in set(utterance["speaker"] for utterance in data["utterances"])}
-
-        for utterance in sorted(data["utterances"], key=lambda x: x['start']):
-            speaker = utterance["speaker"]
-            start = max(utterance["start"], last_end_time[speaker])
-            end = utterance["end"]
-            if start < end:
-                utterance_audio = full_audio[start:end]
-                if speaker not in speaker_audios:
-                    speaker_audios[speaker] = utterance_audio
-                else:
-                    speaker_audios[speaker] += utterance_audio
-            last_end_time[speaker] = max(end, last_end_time[speaker])
-
-        for speaker, speaker_audio in speaker_audios.items():
-            max_duration_ms = 5 * 60 * 1000
-            speaker_audio_parts = [speaker_audio[i:i + max_duration_ms] for i in range(0, len(speaker_audio), max_duration_ms)]
-
-            for i, part_audio in enumerate(speaker_audio_parts):
-                output_files.append((f"Speaker_{speaker}_Part_{i + 1}", part_audio))
-
-        return output_files
+            if transcript_data["status"] == "completed":
+                return transcript_data
+            elif transcript_data["status"] == "error":
+                raise Exception(f"Transcription failed: {transcript_data['error']}")
+            else:
+                logger.info("Transcription processing...")
+                time.sleep(5)  # Wait for 5 seconds before polling again
 
     except Exception as e:
-        print(f"Error in creating speaker segments: {str(e)}")
-        return []
+        logger.error(f"Error getting transcript: {str(e)}")
+        raise
+
+def create_speaker_segments(transcript, audio_bytes):
+    """
+    Create speaker segments from the transcript and audio data.
+    :param transcript: The transcript data returned by the get_transcript function.
+    :param audio_bytes: The audio data as bytes.
+    :return: A list of tuples containing the speaker segment filename and audio segment.
+    """
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")  # Load the audio data
+
+        speaker_segments = {}
+        speaker_individual_segments = {}
+
+        for utterance in transcript["utterances"]:  # Process each utterance in the transcript
+            speaker = utterance["speaker"]
+            start = utterance["start"]
+            end = utterance["end"]
+
+            segment = audio[start:end]  # Extract the audio segment for the current utterance
+
+            if speaker not in speaker_segments:
+                speaker_segments[speaker] = segment
+            else:
+                pause = AudioSegment.silent(duration=PAUSE_DURATION_MS)
+                speaker_segments[speaker] += pause + segment  # Concatenate the segments with a pause
+
+            if speaker not in speaker_individual_segments:
+                speaker_individual_segments[speaker] = [segment]
+            else:
+                speaker_individual_segments[speaker].append(segment)
+
+        output_files = []
+        for speaker, audio_segment in speaker_segments.items():  # Export the audio files for each speaker
+            output_files.append((f"speaker_{speaker}.mp3", audio_segment))
+
+        for speaker, segments in speaker_individual_segments.items():  # Export the individual audio files for each speaker
+            for i, segment in enumerate(segments):
+                output_files.append((f"speaker_{speaker}_segment_{i+1}.mp3", segment))
+
+        return output_files
+    except Exception as e:
+        logger.error(f"Error creating speaker segments: {str(e)}")
+        raise
+
+@app.route('/process_video', methods=['POST'])
+def process_video_endpoint():
+    """
+    Process a YouTube video and return the isolated speaker audio files.
+    Expected JSON payload: {"youtube_url": "https://www.youtube.com/watch?v=VIDEO_ID"}
+    :return: A ZIP file containing the isolated speaker audio files.
+    """
+    try:
+        if not request.json or 'youtube_url' not in request.json:
+            abort(400, description="Invalid request. Please provide 'youtube_url'.")
+
+        youtube_url = request.json['youtube_url']
+        parsed_url = urlparse(youtube_url)
+        if not re.match(r'^(www\.)?youtube\.com', parsed_url.netloc):  # Validate the YouTube URL
+            abort(400, description="Invalid YouTube URL.")
+
+        api_key = API_KEY
+        if not api_key:
+            abort(400, description="Missing API key. Please set the ASSEMBLY_AI_API_KEY environment variable.")
+
+        original_audio_bytes = download_youtube_video(youtube_url)  # Download the audio from the YouTube video
+        upload_url = upload_audio(original_audio_bytes.getvalue(), api_key)  # Upload the audio to AssemblyAI
+        transcript = get_transcript(upload_url, api_key)  # Get the transcript using the AssemblyAI API
+        speakers_audio = create_speaker_segments(transcript, original_audio_bytes.getvalue())  # Create speaker segments
+
+        # Create a ZIP file containing the output audio files
+        zip_file = io.BytesIO()
+        with zipfile.ZipFile(zip_file, 'w') as zipf:
+            for speaker_audio_tuple in speakers_audio:
+                file_name = speaker_audio_tuple[0]
+                audio_data = speaker_audio_tuple[1]
+                zipf.writestr(file_name, audio_data.export(format="mp3").read())
+
+        zip_file.seek(0)
+
+        # Return the ZIP file as a downloadable attachment
+        return send_file(
+            zip_file,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='speaker_segments.zip'
+        )
+
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        abort(500, description="An error occurred while processing the video.")
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000)
