@@ -104,4 +104,4 @@ The tool uses Python's `logging` module for logging. Log messages are output to 
 
 ## License
 
-This project is distributed under the MIT License. See the [LICENSE](LICENSE.md) file for more information.
+This project is distributed under the MIT License. See the [LICENSE](LICENSE) file for more information.
