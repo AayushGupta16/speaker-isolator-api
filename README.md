@@ -66,7 +66,7 @@ This tool allows you to isolate speakers from a YouTube video using AssemblyAI's
     python3 main.py
     ```
 
-2. Make a POST request to the `/process_video` endpoint with the following JSON payload:
+2. Make a `POST` request to the `/process_video` endpoint with the following JSON payload:
 
     ```json
     {
