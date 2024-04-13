@@ -1,4 +1,4 @@
-# Speaker Isolator
+# Speaker Isolator API
 
 This tool allows you to isolate speakers from a YouTube video using AssemblyAI's Speaker Diarization API.
 
@@ -30,7 +30,7 @@ This tool allows you to isolate speakers from a YouTube video using AssemblyAI's
 4. Activate the virtual environment:
     - For Windows:
 
-        ```bash
+        ```powershell
         venv\Scripts\activate
         ```
 
@@ -48,13 +48,15 @@ This tool allows you to isolate speakers from a YouTube video using AssemblyAI's
 
 ## Configuration
 
-1. Open the `main.py` file.
+1. Create a `.env` file in the project root directory.
 
-2. Replace `"YOUR_API_KEY"` with your actual AssemblyAI API key:
+2. Add your AssemblyAI API key to the `.env` file:
 
-    ```python
-    API_KEY = "YOUR_API_KEY"
     ```
+    ASSEMBLY_AI_API_KEY="YOUR_API_KEY"
+    ```
+
+    Replace `"YOUR_API_KEY"` with your actual AssemblyAI API key, including the double quotes.
 
 ## Usage
 
@@ -75,7 +77,7 @@ This tool allows you to isolate speakers from a YouTube video using AssemblyAI's
     You can use the following `curl` command to make the request:
 
     ```bash
-    curl -X POST -H "Content-Type: application/json" -d '{"youtube_url": "YOUR_YOUTUBE_VIDEO_URL"}' http://localhost:8000/process_video
+    curl -X POST -H "Content-Type: application/json" -d '{"youtube_url": "YOUR_YOUTUBE_VIDEO_URL"}' -o speaker_segments.zip http://localhost:8000/process_video
     ```
 
     Replace `YOUR_YOUTUBE_VIDEO_URL` with the actual URL of the YouTube video you want to process.
@@ -88,6 +90,7 @@ The tool includes error handling for the following scenarios:
 
 - Invalid request payload
 - Invalid YouTube URL
+- Missing API key
 - Errors during YouTube video download
 - Errors during audio upload to AssemblyAI
 - Errors during transcription process
